@@ -150,7 +150,7 @@ st.warning(
 st.markdown("### Navigate Project Reality")
 page = st.radio(
     "Choose a section",
-    ["Overview", "Project explorer", "Risk review queue", "GPS Road Verification", "Construction Photo Evidence Review", "Data notes"],
+    ["Overview", "Project explorer", "Risk review queue", "Money Trail & Fund Reconciliation", "GPS Road Verification", "Construction Photo Evidence Review", "Data notes"],
     horizontal=True,
     label_visibility="collapsed",
     key="main_page_navigation",
@@ -388,6 +388,194 @@ elif page == "Risk review queue":
         st.dataframe(display, width="stretch", hide_index=True, height=540)
         st.download_button("Download review queue (CSV)", data=flagged.to_csv(index=False).encode("utf-8-sig"), file_name="project_reality_review_queue.csv", mime="text/csv")
 
+
+elif page == "Money Trail & Fund Reconciliation":
+    st.subheader("Money Trail & Fund Reconciliation")
+    st.write(
+        "Follow project financial records from the reported project cost to fund releases, "
+        "contractor payments, invoices, and supporting documents."
+    )
+    st.info(
+        "The PAIMANA March 2026 dataset contains aggregate cost and cumulative-expenditure fields. "
+        "It does not contain transaction-level releases, contractor payments, or invoices. "
+        "Upload a genuine transaction ledger below to perform reference-based checks. "
+        "No missing-money conclusion is generated from the project budget alone."
+    )
+
+    choices = filtered[["project_code", "project_name"]].astype(str).drop_duplicates()
+    choices["label"] = choices["project_code"] + " — " + choices["project_name"].str.slice(0, 115)
+    if choices.empty:
+        st.warning("No projects match the current search and filters. Clear or adjust the filters above.")
+    else:
+        preferred = choices.index[choices["project_code"].astype(str).str.strip() == "618511"].tolist()
+        default_idx = choices.index.get_loc(preferred[0]) if preferred else 0
+        selection = st.selectbox(
+            "Select the project to investigate",
+            choices["label"].tolist(),
+            index=min(default_idx, len(choices) - 1),
+            key="money_trail_project",
+        )
+        selected_code = choices.loc[choices["label"] == selection, "project_code"].iloc[0].strip()
+        item = filtered[filtered["project_code"].astype(str).str.strip() == selected_code].iloc[0]
+
+        st.markdown(f"### {item['project_name']}")
+        st.caption(
+            f"Project code: {selected_code} · {item['implementing_agency']} · "
+            f"Source snapshot: {item.get('report_month', 'March 2026')}"
+        )
+
+        original_cost = float(item["original_cost_crore"]) if pd.notna(item["original_cost_crore"]) else 0.0
+        revised_cost = float(item["revised_cost_crore"]) if pd.notna(item["revised_cost_crore"]) else 0.0
+        expenditure = float(item["cumulative_expenditure_crore"]) if pd.notna(item["cumulative_expenditure_crore"]) else 0.0
+        progress = float(item["physical_progress_pct"]) if pd.notna(item["physical_progress_pct"]) else None
+        expenditure_pct = (expenditure / revised_cost * 100) if revised_cost > 0 else None
+        cost_less_spend = revised_cost - expenditure
+
+        a, b, c, d = st.columns(4)
+        a.metric("Original cost", f"₹{original_cost:,.2f} Cr")
+        b.metric("Revised cost", f"₹{revised_cost:,.2f} Cr")
+        c.metric("Cumulative expenditure", f"₹{expenditure:,.2f} Cr")
+        d.metric("Reported physical progress", f"{progress:.1f}%" if progress is not None else "Not provided")
+
+        st.markdown("#### What the existing project dataset tells us")
+        e, f, g = st.columns(3)
+        e.metric("Expenditure / revised cost", f"{expenditure_pct:.2f}%" if expenditure_pct is not None else "Not calculable")
+        f.metric("Revised cost less expenditure", f"₹{cost_less_spend:,.2f} Cr")
+        g.metric("Funds released", "Not in dataset")
+        st.caption(
+            "‘Revised cost less expenditure’ is an arithmetic comparison, not a cash balance or missing-money estimate. "
+            "Project cost, fund release, expenditure and contractor payments are different accounting concepts."
+        )
+
+        st.markdown("#### Add the transaction-level records")
+        st.write(
+            "Upload a CSV containing records from an official fund-release report, payment ledger, invoice register, "
+            "or other traceable source. The app processes the upload for this session; it does not permanently store "
+            "the file in a database."
+        )
+        expected_cols = [
+            "project_code", "record_type", "record_id", "date", "counterparty",
+            "amount_crore", "linked_record_id", "description", "source_url", "verification_status"
+        ]
+        template_df = pd.DataFrame(columns=expected_cols)
+        st.download_button(
+            "Download transaction CSV template",
+            data=template_df.to_csv(index=False).encode("utf-8-sig"),
+            file_name="project_reality_transaction_template.csv",
+            mime="text/csv",
+            key="download_money_trail_template",
+        )
+        st.caption(
+            "Required columns: project_code, record_type, record_id, date, counterparty, amount_crore, "
+            "linked_record_id, description, source_url, verification_status. "
+            "Use record_type values: fund_release, payment, invoice, or work_certificate. "
+            "For a payment-to-invoice check, put the invoice's record_id in the payment row's linked_record_id. "
+            "Amounts must be in ₹ crore. Include only records you can source."
+        )
+        uploaded_ledger = st.file_uploader(
+            "Upload the transaction ledger (CSV)",
+            type=["csv"],
+            key="money_trail_ledger_upload",
+        )
+
+        if uploaded_ledger is not None:
+            try:
+                ledger = pd.read_csv(uploaded_ledger, encoding="utf-8-sig", dtype={"project_code": str})
+            except Exception as exc:
+                st.error(f"Could not read the uploaded CSV: {exc}")
+                ledger = None
+
+            if ledger is not None:
+                missing_cols = [col for col in expected_cols if col not in ledger.columns]
+                if missing_cols:
+                    st.error("The uploaded CSV is missing these required columns: " + ", ".join(missing_cols))
+                else:
+                    ledger = ledger[expected_cols].copy()
+                    for col in ["project_code", "record_type", "record_id", "date", "counterparty", "linked_record_id", "description", "source_url", "verification_status"]:
+                        ledger[col] = ledger[col].fillna("").astype(str).str.strip()
+                    ledger["record_type"] = ledger["record_type"].str.casefold()
+                    ledger["amount_crore"] = pd.to_numeric(ledger["amount_crore"], errors="coerce")
+                    ledger["project_code_normalized"] = ledger["project_code"].str.replace(r"\.0$", "", regex=True).str.strip()
+                    ledger["record_id_normalized"] = ledger["record_id"].str.strip()
+                    ledger["linked_record_id_normalized"] = ledger["linked_record_id"].str.strip()
+                    allowed_types = {"fund_release", "payment", "invoice", "work_certificate"}
+                    invalid_types = sorted(set(ledger["record_type"]) - allowed_types - {""})
+                    bad_amounts = ledger["amount_crore"].isna() | (ledger["amount_crore"] < 0)
+                    if invalid_types:
+                        st.warning("Unrecognized record_type value(s): " + ", ".join(invalid_types) + ". Use the values listed above.")
+                    if bad_amounts.any():
+                        st.warning(f"{int(bad_amounts.sum())} row(s) have a missing, non-numeric, or negative amount and will be excluded from monetary totals.")
+
+                    project_ledger = ledger[ledger["project_code_normalized"] == selected_code].copy()
+                    if project_ledger.empty:
+                        st.warning(f"No uploaded records match project code {selected_code}. Check the project_code values in your CSV.")
+                    else:
+                        valid_amount = project_ledger["amount_crore"].notna() & (project_ledger["amount_crore"] >= 0)
+                        records = project_ledger[valid_amount].copy()
+                        releases = records.loc[records["record_type"] == "fund_release", "amount_crore"].sum()
+                        payments = records.loc[records["record_type"] == "payment", "amount_crore"].sum()
+                        invoices = records.loc[records["record_type"] == "invoice", "amount_crore"].sum()
+                        certs = records.loc[records["record_type"] == "work_certificate", "amount_crore"].sum()
+
+                        st.markdown(f"#### Uploaded records for project {selected_code}")
+                        r1, r2, r3, r4 = st.columns(4)
+                        r1.metric("Recorded fund releases", f"₹{releases:,.2f} Cr")
+                        r2.metric("Recorded payments", f"₹{payments:,.2f} Cr")
+                        r3.metric("Recorded invoice amounts", f"₹{invoices:,.2f} Cr")
+                        r4.metric("Work certificate amounts", f"₹{certs:,.2f} Cr")
+
+                        invoice_rows = records[records["record_type"] == "invoice"].copy()
+                        payment_rows = records[records["record_type"] == "payment"].copy()
+                        invoice_ids = set(invoice_rows.loc[invoice_rows["record_id_normalized"] != "", "record_id_normalized"])
+                        payment_rows["invoice_reference_found"] = payment_rows["linked_record_id_normalized"].isin(invoice_ids) & (payment_rows["linked_record_id_normalized"] != "")
+                        linked_payment_amount = payment_rows.loc[payment_rows["invoice_reference_found"], "amount_crore"].sum()
+                        unlinked_payment_rows = payment_rows[~payment_rows["invoice_reference_found"]]
+                        unlinked_payment_amount = unlinked_payment_rows["amount_crore"].sum()
+
+                        p1, p2, p3 = st.columns(3)
+                        p1.metric("Payments linked to an uploaded invoice ID", f"₹{linked_payment_amount:,.2f} Cr")
+                        p2.metric("Payments without a matching invoice ID", f"₹{unlinked_payment_amount:,.2f} Cr")
+                        p3.metric("Payment rows needing reference review", f"{len(unlinked_payment_rows):,}")
+                        st.caption(
+                            "A reference match only means the entered invoice ID exists in this uploaded file. "
+                            "It does not prove that the payment was proper, that the invoice is genuine, or that the work was completed."
+                        )
+
+                        if not invoice_rows.empty:
+                            inv_totals = invoice_rows.groupby("record_id_normalized", dropna=False)["amount_crore"].sum().rename("Invoice amount (₹ crore)")
+                            pay_totals = payment_rows[payment_rows["invoice_reference_found"]].groupby("linked_record_id_normalized")["amount_crore"].sum().rename("Payments linked (₹ crore)")
+                            reconciliation = pd.concat([inv_totals, pay_totals], axis=1).fillna(0).reset_index().rename(columns={"record_id_normalized": "Invoice record ID"})
+                            reconciliation["Invoice amount less linked payments (₹ crore)"] = reconciliation["Invoice amount (₹ crore)"] - reconciliation["Payments linked (₹ crore)"]
+                            reconciliation["Review note"] = reconciliation["Invoice amount less linked payments (₹ crore)"].apply(
+                                lambda value: "Amounts match within ₹0.01 Cr tolerance" if abs(value) <= 0.01 else ("Invoice amount exceeds linked payments; check payment timing/retention" if value > 0 else "Linked payments exceed invoice amount; check links/duplicates/adjustments")
+                            )
+                            st.markdown("#### Invoice-to-payment reference check")
+                            st.dataframe(reconciliation, width="stretch", hide_index=True)
+                            st.caption(
+                                "Differences are review prompts, not proof of missing money. Partial payments, advances, retention, taxes, "
+                                "multiple invoices, amendments or different accounting periods can explain differences. Verify the contract and ledger before interpreting them."
+                            )
+
+                        source_missing = (records["source_url"].str.strip() == "")
+                        not_marked_verified = ~records["verification_status"].str.casefold().eq("verified")
+                        s1, s2 = st.columns(2)
+                        s1.metric("Records without a source URL", f"{int(source_missing.sum()):,}")
+                        s2.metric("Records not marked 'verified'", f"{int(not_marked_verified.sum()):,}")
+                        st.markdown("#### Uploaded ledger records")
+                        show_cols = ["project_code", "record_type", "record_id", "date", "counterparty", "amount_crore", "linked_record_id", "description", "source_url", "verification_status"]
+                        st.dataframe(project_ledger[show_cols], width="stretch", hide_index=True)
+                        st.download_button(
+                            "Download filtered ledger records (CSV)",
+                            data=project_ledger[show_cols].to_csv(index=False).encode("utf-8-sig"),
+                            file_name=f"project_reality_ledger_{selected_code}.csv",
+                            mime="text/csv",
+                            key="download_filtered_money_trail",
+                        )
+                        st.warning(
+                            "Do not subtract invoice totals, recorded payments, and PAIMANA cumulative expenditure as if they were separate pots of money. "
+                            "They may describe overlapping stages of the same expenditure and may cover different dates or accounting scopes. "
+                            "A defensible unexplained amount requires reconciled source records and a defined accounting period."
+                        )
 
 elif page == "GPS Road Verification":
     st.subheader("GPS Road Verification")
