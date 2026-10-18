@@ -150,7 +150,7 @@ st.warning(
 st.markdown("### Navigate Project Reality")
 page = st.radio(
     "Choose a section",
-    ["Overview", "Project explorer", "Risk review queue", "Money Trail & Fund Reconciliation", "GPS Road Verification", "Construction Photo Evidence Review", "Data notes"],
+    ["Overview", "Project explorer", "Risk review queue", "Money Trail & Fund Reconciliation", "Road Length Reality Check", "GPS Road Verification", "Construction Photo Evidence Review", "Data notes"],
     horizontal=True,
     label_visibility="collapsed",
     key="main_page_navigation",
@@ -576,6 +576,208 @@ elif page == "Money Trail & Fund Reconciliation":
                             "They may describe overlapping stages of the same expenditure and may cover different dates or accounting scopes. "
                             "A defensible unexplained amount requires reconciled source records and a defined accounting period."
                         )
+
+elif page == "Road Length Reality Check":
+    st.subheader("Road Length Reality Check")
+    st.write(
+        "Compare the approved road length with the length reported as completed "
+        "and, where genuine matching GPS evidence exists, the measured track length."
+    )
+    st.warning(
+        "This tool calculates differences from values entered by the reviewer. "
+        "It does not independently authenticate documents, prove the entire road was built, "
+        "or establish missing money. Compare the same road sections and chainages."
+    )
+
+    choices = filtered[["project_code", "project_name"]].astype(str).drop_duplicates()
+    choices["label"] = choices["project_code"] + " — " + choices["project_name"].str.slice(0, 115)
+    if choices.empty:
+        st.warning("No projects match the current search and filters. Clear or adjust the filters above.")
+    else:
+        preferred = choices.index[choices["project_code"].astype(str).str.strip() == "618511"].tolist()
+        default_idx = choices.index.get_loc(preferred[0]) if preferred else 0
+        selection = st.selectbox(
+            "Select the project to investigate",
+            choices["label"].tolist(),
+            index=min(default_idx, len(choices) - 1),
+            key="road_length_project",
+        )
+        selected_code = choices.loc[choices["label"] == selection, "project_code"].iloc[0].strip()
+        item = filtered[filtered["project_code"].astype(str).str.strip() == selected_code].iloc[0]
+        st.markdown(f"### {item['project_name']}")
+        st.caption(f"Project code: {selected_code} · {item['implementing_agency']} · Source snapshot: March 2026")
+
+        if selected_code == "618511":
+            st.info(
+                "A Ministry/PIB release has described 41 km of Pune–Satara NH-48 service/slip roads. "
+                "Treat this as a reported scope figure until it is matched to the approved contract/BOQ "
+                "and exact chainages. It is not a measurement of the road already built."
+            )
+            st.markdown(
+                "Source reference: [Ministry of Road Transport and Highways / PIB release]"
+                "(https://www.pib.gov.in/PressReleasePage.aspx?PRID=2198344&lang=1&reg=1)"
+            )
+
+        st.markdown("#### 1. Enter comparable length records")
+        st.caption(
+            "Only enter lengths supported by records. If one measurement covers a different road section, "
+            "direction, service road, or chainage range, do not compare it directly with another."
+        )
+
+        approved_available = st.checkbox(
+            "I have an approved/tendered length for this exact scope",
+            value=False,
+            key="road_approved_available",
+        )
+        approved_length = None
+        approved_source = ""
+        approved_scope = ""
+        if approved_available:
+            approved_length = st.number_input(
+                "Approved/tendered length (km)", min_value=0.0, max_value=5000.0,
+                value=0.0, step=0.1, format="%.3f",
+                key="road_approved_length",
+            )
+            approved_scope = st.text_input(
+                "Approved chainages / section covered", key="road_approved_scope",
+                placeholder="e.g. start chainage to end chainage; both sides if applicable",
+            )
+            approved_source = st.text_input(
+                "Approved length source URL or document reference", key="road_approved_source",
+                value="",
+            )
+
+        reported_available = st.checkbox(
+            "I have an official reported-completed length",
+            value=False,
+            key="road_reported_available",
+        )
+        reported_length = None
+        reported_source = ""
+        reported_date = ""
+        if reported_available:
+            reported_length = st.number_input(
+                "Reported completed length (km)", min_value=0.0, max_value=5000.0,
+                value=0.0, step=0.1, format="%.3f", key="road_reported_length",
+            )
+            reported_date = st.text_input(
+                "Report date / reporting period", key="road_reported_date", placeholder="e.g. March 2026"
+            )
+            reported_source = st.text_input(
+                "Reported completion source URL or document reference", key="road_reported_source"
+            )
+
+        gps_available = st.checkbox(
+            "I have a genuine GPS measurement matching this same road scope",
+            value=False,
+            key="road_gps_available",
+        )
+        gps_length = None
+        gps_source = ""
+        gps_scope = ""
+        if gps_available:
+            gps_length = st.number_input(
+                "GPS-measured track length (km)", min_value=0.0, max_value=5000.0,
+                value=0.0, step=0.001, format="%.3f", key="road_gps_length",
+            )
+            gps_scope = st.text_input(
+                "GPS track coverage / chainages", key="road_gps_scope",
+                placeholder="Confirm the track covers the same approved section",
+            )
+            gps_source = st.text_input(
+                "GPS evidence reference / file name / source URL", key="road_gps_source"
+            )
+
+        st.markdown("#### 2. Comparison results")
+        available_lengths = []
+        if approved_length is not None:
+            available_lengths.append(("Approved/tendered", approved_length))
+        if reported_length is not None:
+            available_lengths.append(("Reported completed", reported_length))
+        if gps_length is not None:
+            available_lengths.append(("GPS-measured", gps_length))
+
+        if approved_length is None or approved_length <= 0:
+            st.info("Enter a positive approved/tendered length for the exact scope first. Without it, a length shortfall cannot be calculated.")
+        else:
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Approved/tendered length", f"{approved_length:,.3f} km")
+            m2.metric("Reported completed length", f"{reported_length:,.3f} km" if reported_length is not None else "Not provided")
+            m3.metric("GPS-measured length", f"{gps_length:,.3f} km" if gps_length is not None else "Not provided")
+
+            result_rows = []
+            if reported_length is not None:
+                diff = reported_length - approved_length
+                pct = (diff / approved_length * 100) if approved_length > 0 else None
+                result_rows.append({
+                    "Comparison": "Reported completed vs approved",
+                    "Reference length (km)": approved_length,
+                    "Compared length (km)": reported_length,
+                    "Difference (km)": round(diff, 3),
+                    "Difference (%)": round(pct, 2) if pct is not None else None,
+                    "Interpretation": "Reported length is below reference; investigate scope and records" if diff < 0 else ("Reported length exceeds reference; confirm scope/measurement" if diff > 0 else "Lengths match numerically"),
+                })
+            if gps_length is not None:
+                diff = gps_length - approved_length
+                pct = (diff / approved_length * 100) if approved_length > 0 else None
+                result_rows.append({
+                    "Comparison": "GPS-measured vs approved",
+                    "Reference length (km)": approved_length,
+                    "Compared length (km)": gps_length,
+                    "Difference (km)": round(diff, 3),
+                    "Difference (%)": round(pct, 2) if pct is not None else None,
+                    "Interpretation": "GPS length is below reference; confirm track coverage and site work" if diff < 0 else ("GPS length exceeds reference; confirm scope/measurement" if diff > 0 else "Lengths match numerically"),
+                })
+            if reported_length is not None and gps_length is not None:
+                diff = gps_length - reported_length
+                pct = (diff / reported_length * 100) if reported_length > 0 else None
+                result_rows.append({
+                    "Comparison": "GPS-measured vs reported completed",
+                    "Reference length (km)": reported_length,
+                    "Compared length (km)": gps_length,
+                    "Difference (km)": round(diff, 3),
+                    "Difference (%)": round(pct, 2) if pct is not None else None,
+                    "Interpretation": "GPS length is lower; inspect track coverage and reported measurement" if diff < 0 else ("GPS length is higher; confirm scope and avoid double-counting" if diff > 0 else "Lengths match numerically"),
+                })
+            if result_rows:
+                result_df = pd.DataFrame(result_rows)
+                st.dataframe(result_df, width="stretch", hide_index=True)
+                st.warning(
+                    "A calculated length difference is a review lead, not proof of missing construction or misused money. "
+                    "Check road section, carriageway/service-road scope, chainages, measurement date, and supporting certificates."
+                )
+                evidence_status = "User-entered evidence references; not independently authenticated by this app."
+                snapshot = pd.DataFrame([{
+                    "project_code": selected_code,
+                    "project_name": item["project_name"],
+                    "approved_length_km": approved_length,
+                    "approved_scope": approved_scope,
+                    "approved_source": approved_source,
+                    "reported_completed_length_km": reported_length,
+                    "reported_completion_date": reported_date,
+                    "reported_completion_source": reported_source,
+                    "gps_measured_length_km": gps_length,
+                    "gps_scope": gps_scope,
+                    "gps_source": gps_source,
+                    "evidence_status": evidence_status,
+                }])
+                st.download_button(
+                    "Download road-length review record (CSV)",
+                    data=snapshot.to_csv(index=False).encode("utf-8-sig"),
+                    file_name=f"road_length_review_{selected_code}.csv",
+                    mime="text/csv",
+                )
+            else:
+                st.info("Add an official reported length or a genuine GPS measurement to calculate a comparison.")
+
+        with st.expander("What this feature can and cannot conclude"):
+            st.markdown(
+                "- It can calculate differences between lengths entered for comparable scopes.\n"
+                "- It cannot authenticate a source URL or prove a GPS track is complete.\n"
+                "- A reported scope length is not the same as completed length.\n"
+                "- A shortfall does not by itself show where money went. Link any finding to bills, payments, "
+                "work certificates and an approved BOQ before drawing a financial conclusion."
+            )
 
 elif page == "GPS Road Verification":
     st.subheader("GPS Road Verification")
