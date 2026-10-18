@@ -1,4 +1,8 @@
 from pathlib import Path
+import json
+import math
+import xml.etree.ElementTree as ET
+
 import pandas as pd
 import plotly.express as px
 import streamlit as st
@@ -67,6 +71,129 @@ def style_chart(fig, height=420):
     fig.update_yaxes(tickfont=dict(size=11, color="#536273"), title_font=dict(size=12, color=NAVY),
                      gridcolor="#E2E8F0", linecolor="#CBD5E1", zerolinecolor="#CBD5E1")
     return fig
+
+
+
+def gps_distance_km(point1, point2):
+    """Calculate the great-circle distance between (latitude, longitude) points."""
+    lat1, lon1 = point1
+    lat2, lon2 = point2
+    earth_radius_km = 6371.0088
+    lat1 = math.radians(lat1)
+    lat2 = math.radians(lat2)
+    delta_lat = math.radians(lat2 - lat1)
+    delta_lon = math.radians(lon2 - lon1)
+    a = (
+        math.sin(delta_lat / 2) ** 2
+        + math.cos(lat1) * math.cos(lat2) * math.sin(delta_lon / 2) ** 2
+    )
+    a = max(0.0, min(1.0, a))
+    return 2 * earth_radius_km * math.asin(math.sqrt(a))
+
+
+def gps_line_distance_km(points):
+    return sum(
+        gps_distance_km(points[index], points[index + 1])
+        for index in range(len(points) - 1)
+    )
+
+
+def parse_gps_geojson(data):
+    obj = json.loads(data.decode("utf-8-sig"))
+    lines = []
+
+    def visit(item):
+        if not isinstance(item, dict):
+            return
+        geometry_type = item.get("type")
+        if geometry_type == "FeatureCollection":
+            for feature in item.get("features", []):
+                visit(feature)
+        elif geometry_type == "Feature":
+            visit(item.get("geometry"))
+        elif geometry_type == "GeometryCollection":
+            for geometry in item.get("geometries", []):
+                visit(geometry)
+        elif geometry_type == "LineString":
+            points = [
+                (float(coord[1]), float(coord[0]))
+                for coord in item.get("coordinates", [])
+                if isinstance(coord, (list, tuple)) and len(coord) >= 2
+            ]
+            if len(points) >= 2:
+                lines.append(points)
+        elif geometry_type == "MultiLineString":
+            for coordinates in item.get("coordinates", []):
+                points = [
+                    (float(coord[1]), float(coord[0]))
+                    for coord in coordinates
+                    if isinstance(coord, (list, tuple)) and len(coord) >= 2
+                ]
+                if len(points) >= 2:
+                    lines.append(points)
+
+    visit(obj)
+    if not lines:
+        raise ValueError("No usable LineString or MultiLineString was found in the file.")
+    return lines
+
+
+def parse_gps_gpx(data):
+    root = ET.fromstring(data)
+    lines = []
+
+    def local_name(element):
+        return element.tag.rsplit("}", 1)[-1]
+
+    for segment in root.iter():
+        if local_name(segment) == "trkseg":
+            points = [
+                (float(point.attrib["lat"]), float(point.attrib["lon"]))
+                for point in segment.iter()
+                if local_name(point) == "trkpt"
+            ]
+            if len(points) >= 2:
+                lines.append(points)
+
+    if not lines:
+        for route in root.iter():
+            if local_name(route) == "rte":
+                points = [
+                    (float(point.attrib["lat"]), float(point.attrib["lon"]))
+                    for point in route.iter()
+                    if local_name(point) == "rtept"
+                ]
+                if len(points) >= 2:
+                    lines.append(points)
+
+    if not lines:
+        points = [
+            (float(point.attrib["lat"]), float(point.attrib["lon"]))
+            for point in root.iter()
+            if local_name(point) == "trkpt"
+        ]
+        if len(points) >= 2:
+            lines.append(points)
+
+    if not lines:
+        raise ValueError("No usable GPS track points were found in the GPX file.")
+    return lines
+
+
+def parse_gps_track(filename, data):
+    """Return track lines and point count for a GPX, GeoJSON, or JSON upload."""
+    if filename.lower().endswith(".gpx"):
+        lines = parse_gps_gpx(data)
+    elif filename.lower().endswith((".geojson", ".json")):
+        lines = parse_gps_geojson(data)
+    else:
+        raise ValueError("Use a .gpx, .geojson, or .json track file.")
+
+    point_count = sum(len(line) for line in lines)
+    total_km = sum(gps_line_distance_km(line) for line in lines)
+    if not math.isfinite(total_km) or total_km <= 0:
+        raise ValueError("The uploaded track has no positive, usable distance.")
+    return lines, total_km, point_count
 
 
 def crore_to_lakh_crore(value):
@@ -667,26 +794,89 @@ elif page == "Road Length Reality Check":
                 "Reported completion source URL or document reference", key="road_reported_source"
             )
 
-        gps_available = st.checkbox(
-            "I have a genuine GPS measurement matching this same road scope",
-            value=False,
-            key="road_gps_available",
+        st.markdown("#### Upload a GPS track to calculate its length")
+        st.caption(
+            "Upload a genuine track covering the same road sections and chainages as the approved length. "
+            "The bundled sample track used by the separate GPS demo is synthetic and must not be used as project evidence."
+        )
+        uploaded_gps = st.file_uploader(
+            "Upload genuine GPS evidence (.gpx, .geojson or .json)",
+            type=["gpx", "geojson", "json"],
+            key=f"road_gps_upload_{selected_code}",
         )
         gps_length = None
         gps_source = ""
         gps_scope = ""
-        if gps_available:
-            gps_length = st.number_input(
-                "GPS-measured track length (km)", min_value=0.0, max_value=5000.0,
-                value=0.0, step=0.001, format="%.3f", key="road_gps_length",
-            )
-            gps_scope = st.text_input(
-                "GPS track coverage / chainages", key="road_gps_scope",
-                placeholder="Confirm the track covers the same approved section",
-            )
-            gps_source = st.text_input(
-                "GPS evidence reference / file name / source URL", key="road_gps_source"
-            )
+        gps_method = "Not provided"
+        gps_point_count = 0
+        gps_segment_count = 0
+        gps_confirmation_status = "Not provided"
+
+        if uploaded_gps is not None:
+            gps_source = uploaded_gps.name
+            try:
+                gps_lines, calculated_gps_km, gps_point_count = parse_gps_track(
+                    uploaded_gps.name, uploaded_gps.getvalue()
+                )
+                gps_segment_count = len(gps_lines)
+                st.metric("Calculated length from uploaded track", f"{calculated_gps_km:,.3f} km")
+                st.caption(
+                    f"File: {uploaded_gps.name} · {gps_point_count:,} points · "
+                    f"{gps_segment_count:,} track segment(s). This is a coordinate-based calculation, not independent proof of road completion."
+                )
+                gps_scope = st.text_input(
+                    "GPS track coverage / chainages",
+                    key=f"road_gps_scope_{selected_code}",
+                    placeholder="Describe the road section, direction, and start/end chainages covered",
+                )
+                gps_confirmed = st.checkbox(
+                    "I confirm this is genuine GPS evidence and matches the same approved road scope",
+                    value=False,
+                    key=f"road_gps_confirm_{selected_code}",
+                )
+                if gps_confirmed:
+                    gps_length = calculated_gps_km
+                    gps_method = "Uploaded GPS track; length calculated by this app"
+                    gps_confirmation_status = "User confirmed scope and authenticity; not independently authenticated by the app"
+                    st.success("GPS track length will be included in the road-length comparison.")
+                else:
+                    st.warning(
+                        "The calculated length is shown for inspection only. Confirm the track's source and matching scope "
+                        "before the app uses it in comparison results."
+                    )
+            except Exception as exc:
+                st.error(f"Could not calculate length from this GPS file: {exc}")
+                st.caption("Check that the file is valid and contains a line track with at least two coordinates.")
+        else:
+            with st.expander("Already have a GPS length from a separate survey record? Enter it instead"):
+                manual_gps_available = st.checkbox(
+                    "I have a documented GPS measurement for this same road scope",
+                    value=False,
+                    key=f"road_manual_gps_available_{selected_code}",
+                )
+                if manual_gps_available:
+                    manual_gps_length = st.number_input(
+                        "GPS-measured length from the report (km)", min_value=0.0, max_value=5000.0,
+                        value=0.0, step=0.001, format="%.3f", key=f"road_manual_gps_length_{selected_code}",
+                    )
+                    gps_scope = st.text_input(
+                        "GPS report coverage / chainages", key=f"road_manual_gps_scope_{selected_code}",
+                        placeholder="Confirm this covers the same approved section",
+                    )
+                    gps_source = st.text_input(
+                        "GPS report reference or source URL", key=f"road_manual_gps_source_{selected_code}"
+                    )
+                    manual_confirmed = st.checkbox(
+                        "I confirm this length is copied from a genuine, traceable GPS survey record",
+                        value=False,
+                        key=f"road_manual_gps_confirm_{selected_code}",
+                    )
+                    if manual_gps_length > 0 and manual_confirmed:
+                        gps_length = float(manual_gps_length)
+                        gps_method = "Manually transcribed from separate GPS survey record"
+                        gps_confirmation_status = "User confirmed; source not independently authenticated by the app"
+                    elif manual_gps_length > 0:
+                        st.warning("Confirm that the source is genuine before including this value in comparison results.")
 
         st.markdown("#### 2. Comparison results")
         available_lengths = []
@@ -757,8 +947,12 @@ elif page == "Road Length Reality Check":
                     "reported_completion_date": reported_date,
                     "reported_completion_source": reported_source,
                     "gps_measured_length_km": gps_length,
+                    "gps_measurement_method": gps_method,
+                    "gps_uploaded_point_count": gps_point_count,
+                    "gps_uploaded_segment_count": gps_segment_count,
                     "gps_scope": gps_scope,
                     "gps_source": gps_source,
+                    "gps_confirmation_status": gps_confirmation_status,
                     "evidence_status": evidence_status,
                 }])
                 st.download_button(
