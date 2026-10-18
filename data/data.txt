@@ -1,0 +1,22 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "DEMO ONLY - Sample Road GPS Track",
+        "evidence_type": "synthetic_sample_not_real_project_evidence"
+      },
+      "geometry": {
+        "type": "LineString",
+        "coordinates": [
+          [73.8500, 18.6500],
+          [73.8510, 18.6502],
+          [73.8520, 18.6505],
+          [73.8530, 18.6507],
+          [73.8540, 18.6510]
+        ]
+      }
+    }
+  ]
+}
