@@ -2,6 +2,10 @@ from pathlib import Path
 import json
 import math
 import xml.etree.ElementTree as ET
+import hashlib
+import io
+import zipfile
+from datetime import date, datetime
 
 import pandas as pd
 import plotly.express as px
@@ -49,6 +53,26 @@ st.markdown(
     [data-testid="stAlert"] {{ background-color: #FFF7D6 !important; border: 1px solid #F0D36B !important; }}
     [data-testid="stAlert"] * {{ color: #624B00 !important; }}
     [data-baseweb="select"] *, [data-baseweb="tag"] {{ color: #1A2C3B !important; }}
+    /* Keep text-entry controls readable against the light page background. */
+    div[data-baseweb="textarea"] textarea,
+    div[data-baseweb="input"] input,
+    textarea,
+    input[type="text"],
+    input[type="date"] {{
+        background-color: #FFFFFF !important;
+        color: #1A2C3B !important;
+        -webkit-text-fill-color: #1A2C3B !important;
+        caret-color: #1A2C3B !important;
+        border-color: #CBD5E1 !important;
+    }}
+    div[data-baseweb="textarea"] textarea::placeholder,
+    div[data-baseweb="input"] input::placeholder,
+    textarea::placeholder,
+    input::placeholder {{
+        color: #7A8795 !important;
+        -webkit-text-fill-color: #7A8795 !important;
+        opacity: 1 !important;
+    }}
     </style>
     """,
     unsafe_allow_html=True,
@@ -266,6 +290,9 @@ for column in text_cols:
     df[column] = df[column].fillna("Not specified").astype(str).str.strip()
 
 df = add_review_flags(df)
+
+# Photo evidence records are session-only until the user downloads the evidence bundle.
+st.session_state.setdefault("project_photo_evidence", [])
 
 st.caption("Data source: PAIMANA March 2026 Flash Report, Table 6: All Ongoing Projects. Project-level data extracted from the report.")
 st.warning(
@@ -734,6 +761,30 @@ elif page == "Road Length Reality Check":
         st.markdown(f"### {item['project_name']}")
         st.caption(f"Project code: {selected_code} · {item['implementing_agency']} · Source snapshot: March 2026")
 
+        linked_photos = [
+            entry for entry in st.session_state.get("project_photo_evidence", [])
+            if str(entry.get("record", {}).get("project_code", "")).strip() == selected_code
+        ]
+        if linked_photos:
+            st.info(
+                f"Construction photo evidence recorded in this browser session for this project: "
+                f"{len(linked_photos)} item(s). These records are user-entered and not independently authenticated."
+            )
+            photo_summary = pd.DataFrame([
+                {
+                    "Evidence ID": entry["record"].get("evidence_id", ""),
+                    "Photo": entry.get("filename", ""),
+                    "Inspection date": entry["record"].get("inspection_date_recorded_by_reviewer", ""),
+                    "Category": entry["record"].get("evidence_category", ""),
+                    "Assessment": entry["record"].get("reviewer_assessment", ""),
+                    "Verification status": entry["record"].get("verification_status", ""),
+                }
+                for entry in linked_photos
+            ])
+            st.dataframe(photo_summary, width="stretch", hide_index=True)
+        else:
+            st.caption("No construction photo records are linked to this project in the current browser session.")
+
         if selected_code == "618511":
             st.info(
                 "A Ministry/PIB release has described 41 km of Pune–Satara NH-48 service/slip roads. "
@@ -992,19 +1043,205 @@ elif page == "GPS Road Verification":
 elif page == "Construction Photo Evidence Review":
     st.subheader("Construction Photo Evidence Review")
     st.write(
-        "Upload a construction-site photo and record observations "
-        "for human review."
+        "Attach a photograph and reviewer observations to a selected project so the evidence can appear "
+        "in that project's Road Length Reality Check during this browser session."
     )
-    st.info(
-        "Photos are supporting evidence for human review and are "
-        "not independently verified by this application."
-    )
-    st.page_link(
-        "pages/3_Photo_Evidence_Review.py",
-        label="Open Construction Photo Evidence Review",
-        icon="📷",
+    st.warning(
+        "A photo alone does not verify project identity, capture location/date, construction quality, "
+        "completion, or wrongdoing. Uploaded images and reviewer-entered details are not independently verified. "
+        "Records are kept only in this active Streamlit session until you download the evidence bundle."
     )
 
+    photo_project_choices = df[["project_code", "project_name", "state", "implementing_agency"]].astype(str).drop_duplicates()
+    photo_project_choices["label"] = (
+        photo_project_choices["project_code"] + " — " + photo_project_choices["project_name"].str.slice(0, 115)
+    )
+    preferred_photo = photo_project_choices.index[
+        photo_project_choices["project_code"].str.strip() == "618511"
+    ].tolist()
+    default_photo_index = photo_project_choices.index.get_loc(preferred_photo[0]) if preferred_photo else 0
+
+    if photo_project_choices.empty:
+        st.warning("No project records are available to attach evidence.")
+    else:
+        photo_project_label = st.selectbox(
+            "Select the project this photo relates to",
+            photo_project_choices["label"].tolist(),
+            index=min(default_photo_index, len(photo_project_choices) - 1),
+            key="photo_evidence_project",
+        )
+        photo_project = photo_project_choices.loc[
+            photo_project_choices["label"] == photo_project_label
+        ].iloc[0]
+        selected_photo_project_code = str(photo_project["project_code"]).strip()
+        st.caption(
+            f"Project code: {selected_photo_project_code} · {photo_project['implementing_agency']} · "
+            f"{photo_project['state']}"
+        )
+
+        with st.form("project_photo_evidence_form", clear_on_submit=True):
+            st.markdown("#### 1. Inspection details")
+            reported_location = st.text_input(
+                "Reported site location",
+                placeholder="Enter road section / location; do not guess coordinates",
+            )
+            inspection_date = st.date_input(
+                "Inspection date recorded by reviewer",
+                value=date.today(),
+            )
+            category = st.selectbox(
+                "Evidence category",
+                [
+                    "Construction progress",
+                    "Road surface or pavement",
+                    "Building or structure",
+                    "Construction materials",
+                    "Site safety",
+                    "Other",
+                ],
+            )
+            assessment = st.selectbox(
+                "Reviewer assessment",
+                [
+                    "Pending human review",
+                    "Potential discrepancy to verify",
+                    "Photo unclear or insufficient",
+                    "No obvious discrepancy visible in this photo",
+                ],
+            )
+            source_reference = st.text_input(
+                "Photo source / reference (optional)",
+                placeholder="e.g. inspection report ID, official URL, or who supplied the photo",
+            )
+            st.markdown("#### 2. Upload a photo and record observations")
+            photo = st.file_uploader(
+                "Choose a JPG or PNG image",
+                type=["jpg", "jpeg", "png"],
+            )
+            notes = st.text_area(
+                "Inspection notes",
+                placeholder="Describe only what is visible and what should be checked next.",
+                height=110,
+            )
+            submitted_photo = st.form_submit_button("Save evidence record for this session")
+
+        if submitted_photo:
+            if photo is None:
+                st.error("Upload a JPG or PNG photograph before saving the evidence record.")
+            else:
+                photo_bytes = photo.getvalue()
+                photo_hash = hashlib.sha256(photo_bytes).hexdigest()
+                duplicate = any(
+                    entry.get("photo_sha256") == photo_hash
+                    and str(entry.get("record", {}).get("project_code", "")).strip() == selected_photo_project_code
+                    for entry in st.session_state["project_photo_evidence"]
+                )
+                if duplicate:
+                    st.warning("This same photo file is already recorded for this project in the current session.")
+                else:
+                    evidence_id = datetime.now().strftime("PHOTO-%Y%m%d-%H%M%S-%f")
+                    record = {
+                        "evidence_id": evidence_id,
+                        "project_code": selected_photo_project_code,
+                        "project_name": str(photo_project["project_name"]),
+                        "implementing_agency": str(photo_project["implementing_agency"]),
+                        "project_state": str(photo_project["state"]),
+                        "reported_site_location": reported_location.strip(),
+                        "inspection_date_recorded_by_reviewer": inspection_date.isoformat(),
+                        "evidence_category": category,
+                        "reviewer_assessment": assessment,
+                        "photo_source_reference": source_reference.strip(),
+                        "inspection_notes": notes.strip(),
+                        "photo_filename": Path(photo.name).name,
+                        "photo_size_bytes": len(photo_bytes),
+                        "photo_sha256": photo_hash,
+                        "record_created_at_local": datetime.now().isoformat(timespec="seconds"),
+                        "verification_status": "Not independently verified",
+                        "limitations": (
+                            "Photo authenticity, capture date, GPS location, project identity, and construction completion "
+                            "have not been independently verified by this application."
+                        ),
+                    }
+                    st.session_state["project_photo_evidence"].append({
+                        "record": record,
+                        "filename": Path(photo.name).name,
+                        "photo_bytes": photo_bytes,
+                        "photo_sha256": photo_hash,
+                    })
+                    st.success(
+                        f"Saved {evidence_id} to this active session and linked it to project {selected_photo_project_code}. "
+                        "Download the evidence bundle before closing or restarting the app."
+                    )
+
+    all_photo_entries = st.session_state.get("project_photo_evidence", [])
+    if all_photo_entries:
+        st.markdown("#### Evidence records saved in this session")
+        all_photo_rows = [
+            {
+                "Evidence ID": entry["record"].get("evidence_id", ""),
+                "Project code": entry["record"].get("project_code", ""),
+                "Project": entry["record"].get("project_name", ""),
+                "Photo": entry.get("filename", ""),
+                "Inspection date": entry["record"].get("inspection_date_recorded_by_reviewer", ""),
+                "Category": entry["record"].get("evidence_category", ""),
+                "Assessment": entry["record"].get("reviewer_assessment", ""),
+                "Verification": entry["record"].get("verification_status", ""),
+            }
+            for entry in all_photo_entries
+        ]
+        st.dataframe(pd.DataFrame(all_photo_rows), width="stretch", hide_index=True)
+
+        export_project_codes = sorted({
+            str(entry["record"].get("project_code", "")).strip() for entry in all_photo_entries
+        })
+        export_scope = st.selectbox(
+            "Evidence bundle to download",
+            ["All projects"] + export_project_codes,
+            key="photo_evidence_export_scope",
+        )
+        if export_scope == "All projects":
+            export_entries = all_photo_entries
+        else:
+            export_entries = [
+                entry for entry in all_photo_entries
+                if str(entry["record"].get("project_code", "")).strip() == export_scope
+            ]
+
+        if export_entries:
+            zip_buffer = io.BytesIO()
+            with zipfile.ZipFile(zip_buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+                records_manifest = []
+                for index, entry in enumerate(export_entries, start=1):
+                    record = entry["record"]
+                    records_manifest.append(record)
+                    safe_filename = Path(entry["filename"]).name
+                    archive.writestr(
+                        f"photos/{record.get('project_code', 'unknown')}/{index}_{safe_filename}",
+                        entry["photo_bytes"],
+                    )
+                archive.writestr(
+                    "inspection_records.json",
+                    json.dumps(records_manifest, indent=2, ensure_ascii=False).encode("utf-8"),
+                )
+            st.download_button(
+                "Download selected photo evidence bundle (ZIP)",
+                data=zip_buffer.getvalue(),
+                file_name=(
+                    "project_reality_photo_evidence_all_projects.zip"
+                    if export_scope == "All projects"
+                    else f"project_reality_photo_evidence_{export_scope}.zip"
+                ),
+                mime="application/zip",
+            )
+        st.caption(
+            "The evidence bundle preserves the uploaded images and JSON records for download. "
+            "It is not a permanent database or independent verification."
+        )
+    else:
+        st.info(
+            "No evidence has been saved in this session yet. Upload a photo, choose its project, "
+            "and save the record. It will then appear in this list and in that project's Road Length Reality Check."
+        )
 
 elif page == "Data notes":
     st.subheader("Data notes and methodology")
